@@ -261,6 +261,23 @@ type DecodeOptions struct {
 	// RawToString controls how raw bytes in a stream are decoded into a nil interface{}.
 	// By default, they are decoded as []byte, but can be decoded as string (if configured).
 	RawToString bool
+
+	// ZeroCopy controls whether decoded byte values may be delivered as views
+	// into the input buffer passed to NewDecoderBytes/ResetBytes (or the
+	// internal read buffer for io.Reader inputs).
+	//
+	// By default (false), every []byte delivered to the caller owns its own
+	// backing array: the decoder copies the bytes before returning them. It is
+	// therefore safe to retain a decoded value while the input buffer is reused
+	// for another frame, or to reuse the Decoder via Reset/ResetBytes.
+	//
+	// When true, the decoder is allowed to return zero-copy views that alias
+	// the input (or an internal scratch) buffer. This avoids an allocation and
+	// copy, but ownership of the returned bytes is transferred to the caller,
+	// who MUST keep the underlying input buffer alive and unmodified and must
+	// not retain the view across a subsequent Decode/Reset call. Values decoded
+	// into a caller-supplied []byte are unaffected (they always use that slice).
+	ZeroCopy bool
 }
 
 // ------------------------------------------------
@@ -405,12 +422,15 @@ func (z *ioDecReader) readx(n uint) (bs []byte) {
 	} else {
 		bs = make([]byte, n)
 	}
-	if _, err := decReadFull(z.rr, bs); err != nil {
-		panic(err)
+	// Count only the bytes actually consumed before the failure, so a
+	// truncated stream reports the same position as a bytes-backed decode.
+	nn, err := decReadFull(z.rr, bs)
+	z.n += nn
+	if z.trb && nn > 0 {
+		z.tr = append(z.tr, bs[:nn]...)
 	}
-	z.n += uint(len(bs))
-	if z.trb {
-		z.tr = append(z.tr, bs...)
+	if err != nil {
+		panic(err)
 	}
 	return
 }
@@ -419,12 +439,13 @@ func (z *ioDecReader) readb(bs []byte) {
 	if len(bs) == 0 {
 		return
 	}
-	if _, err := decReadFull(z.rr, bs); err != nil {
-		panic(err)
+	nn, err := decReadFull(z.rr, bs)
+	z.n += nn
+	if z.trb && nn > 0 {
+		z.tr = append(z.tr, bs[:nn]...)
 	}
-	z.n += uint(len(bs))
-	if z.trb {
-		z.tr = append(z.tr, bs...)
+	if err != nil {
+		panic(err)
 	}
 }
 
@@ -1198,7 +1219,9 @@ func (d *Decoder) selferUnmarshal(f *codecFnInfo, rv reflect.Value) {
 
 func (d *Decoder) binaryUnmarshal(f *codecFnInfo, rv reflect.Value) {
 	bm := rv2i(rv).(encoding.BinaryUnmarshaler)
-	xbs := d.d.DecodeBytes(nil, true)
+	// Detach by default, so the bytes handed to the caller cannot be
+	// invalidated when the input buffer is reused (see DecodeOptions.ZeroCopy).
+	xbs := d.detachDecodedBytes(nil, d.d.DecodeBytes(nil, true))
 	if fnerr := bm.UnmarshalBinary(xbs); fnerr != nil {
 		panic(fnerr)
 	}
@@ -1206,7 +1229,9 @@ func (d *Decoder) binaryUnmarshal(f *codecFnInfo, rv reflect.Value) {
 
 func (d *Decoder) textUnmarshal(f *codecFnInfo, rv reflect.Value) {
 	tm := rv2i(rv).(encoding.TextUnmarshaler)
-	fnerr := tm.UnmarshalText(d.d.DecodeStringAsBytes())
+	// Same ownership guarantee as binaryUnmarshal: do not hand out a view of
+	// the reusable input/scratch buffers unless ZeroCopy was requested.
+	fnerr := tm.UnmarshalText(d.detachDecodedBytes(nil, d.d.DecodeStringAsBytes()))
 	if fnerr != nil {
 		panic(fnerr)
 	}
@@ -2375,6 +2400,9 @@ func (d *Decoder) resetCommon() {
 	if d.maxdepth <= 0 {
 		d.maxdepth = decDefMaxDepth
 	}
+	// clear every value left behind by the previous stream, so a reused
+	// Decoder cannot surface stale naked primitives or retained []byte views.
+	d.n = decNaked{}
 	// reset all things which were cached from the Handle, but could change
 	d.mtid, d.stid = 0, 0
 	d.mtr, d.str = false, false
@@ -2544,13 +2572,19 @@ func (d *Decoder) mustDecode(v interface{}) {
 		return
 	}
 
+	// A buffered reader may hold bytes belonging to the next frame(s).
+	// Only release the buffer at the top level once the whole value is
+	// consumed and no such bytes remain, otherwise those bytes would be
+	// returned to the pool and lost. The defer keeps calls balanced on
+	// the panic path, where the stream becomes stuck until Reset.
 	d.bi.calls++
+	defer func() {
+		d.bi.calls--
+		if !d.h.ExplicitRelease && d.bi.calls == 0 && d.bi.c >= uint(len(d.bi.buf)) {
+			d.bi.release()
+		}
+	}()
 	d.decode(v)
-	// xprintf.(">>>>>>>> >>>>>>>> num decFns: %v\n", d.cf.sn)
-	d.bi.calls--
-	if !d.h.ExplicitRelease && d.bi.calls == 0 {
-		d.bi.release()
-	}
 }
 
 // func (d *Decoder) deferred(err1 *error) {
@@ -3016,6 +3050,20 @@ func detachZeroCopyBytes(isBytesReader bool, dest []byte, in []byte) (out []byte
 		}
 	}
 	return in
+}
+
+// detachDecodedBytes hands bytes read from the stream to caller-facing code
+// that may retain them (e.g. encoding.BinaryUnmarshaler / encoding.TextUnmarshaler).
+//
+// dest, when it has enough capacity, is reused as the destination (its
+// ownership already belongs to the caller). Otherwise the same rules as
+// DecodeOptions.ZeroCopy apply: default mode returns an owned copy, ZeroCopy
+// mode may return a view into the input or scratch buffers.
+func (d *Decoder) detachDecodedBytes(dest, in []byte) []byte {
+	if d.h.ZeroCopy {
+		return in
+	}
+	return detachZeroCopyBytes(d.bytes, dest, in)
 }
 
 // decInferLen will infer a sensible length, given the following:

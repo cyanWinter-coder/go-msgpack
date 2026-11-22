@@ -988,7 +988,9 @@ func (d *jsonDecDriver) DecodeBytes(bs []byte, zerocopy bool) (bsOut []byte) {
 	slen := base64.StdEncoding.DecodedLen(len(bs0))
 	if slen <= cap(bs) {
 		bsOut = bs[:slen]
-	} else if zerocopy && slen <= cap(d.b2) {
+	} else if zerocopy && d.h.ZeroCopy && slen <= cap(d.b2) {
+		// d.b2 is decoder-owned scratch: only hand it out in explicit
+		// zero-copy mode, where the caller accepts the view's ownership.
 		bsOut = d.b2[:slen]
 	} else {
 		bsOut = make([]byte, slen)

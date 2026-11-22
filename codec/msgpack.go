@@ -556,7 +556,7 @@ func (d *msgpackDecDriver) DecodeNaked() {
 			if n.u == uint64(mpTimeExtTagU) {
 				n.v = valueTypeTime
 				n.t = d.decodeTime(clen)
-			} else if d.br {
+			} else if d.br && d.h.ZeroCopy {
 				n.l = d.r.readx(uint(clen))
 			} else {
 				n.l = decByteSlice(d.r, clen, d.d.h.MaxInitLen, d.d.b[:])
@@ -729,7 +729,7 @@ func (d *msgpackDecDriver) DecodeBytes(bs []byte, zerocopy bool) (bsOut []byte) 
 	}
 
 	d.bdRead = false
-	if zerocopy {
+	if zerocopy && d.h.ZeroCopy {
 		if d.br {
 			return d.r.readx(uint(clen))
 		} else if len(bs) == 0 {
@@ -964,7 +964,7 @@ func (d *msgpackDecDriver) decodeExtV(verifyTag bool, tag byte) (xtag byte, xbs 
 			d.d.errorf("wrong extension tag - got %b, expecting %v", xtag, tag)
 			return
 		}
-		if d.br {
+		if d.br && d.h.ZeroCopy {
 			xbs = d.r.readx(uint(clen))
 		} else {
 			xbs = decByteSlice(d.r, clen, d.d.h.MaxInitLen, d.d.b[:])

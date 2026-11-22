@@ -268,7 +268,7 @@ func (f genHelperDecoder) DecJSONUnmarshal(tm jsonUnmarshaler) {
 
 // FOR USE BY CODECGEN ONLY. IT *WILL* CHANGE WITHOUT NOTICE. *DO NOT USE*
 func (f genHelperDecoder) DecBinaryUnmarshal(bm encoding.BinaryUnmarshaler) {
-	fnerr := bm.UnmarshalBinary(f.d.d.DecodeBytes(nil, true))
+	fnerr := bm.UnmarshalBinary(f.d.detachDecodedBytes(nil, f.d.d.DecodeBytes(nil, true)))
 	if fnerr != nil {
 		panic(fnerr)
 	}
