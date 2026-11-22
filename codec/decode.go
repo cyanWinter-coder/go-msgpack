@@ -1298,7 +1298,7 @@ func (d *Decoder) kInterfaceNaked(f *codecFnInfo) (rvn reflect.Value) {
 		if bytes == nil {
 			d.decode(&v)
 		}
-		bfn := d.h.getExtForTag(tag)
+		bfn := d.snapshot().getExtForTag(tag)
 		if bfn == nil {
 			var re RawExt
 			re.Tag = tag
@@ -1665,7 +1665,7 @@ func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 				rv9 = reflect.New(rtelem0).Elem()
 			}
 			if fn == nil {
-				fn = d.h.fn(rtelem, true, true)
+				fn = d.h.fnFor(d.snapshot(), rtelem, true, true)
 			}
 			d.decodeValue(rv9, fn, true)
 			rv.Send(rv9)
@@ -1710,7 +1710,7 @@ func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 				}
 
 				if fn == nil {
-					fn = d.h.fn(rtelem, true, true)
+					fn = d.h.fnFor(d.snapshot(), rtelem, true, true)
 				}
 				d.decodeValue(rv9, fn, true)
 			}
@@ -1822,7 +1822,7 @@ func (d *Decoder) kMap(f *codecFnInfo, rv reflect.Value) {
 			// NOTE: if doing an insert, you MUST use a real string (not stringview)
 		} else {
 			if keyFn == nil {
-				keyFn = d.h.fn(ktypeLo, true, true)
+				keyFn = d.h.fnFor(d.snapshot(), ktypeLo, true, true)
 			}
 			d.decodeValue(rvk, keyFn, true)
 		}
@@ -1892,7 +1892,7 @@ func (d *Decoder) kMap(f *codecFnInfo, rv reflect.Value) {
 			rvk.SetString(d.string(kstrbs))
 		}
 		if valFn == nil {
-			valFn = d.h.fn(vtypeLo, true, true)
+			valFn = d.h.fnFor(d.snapshot(), vtypeLo, true, true)
 		}
 		d.decodeValue(rvv, valFn, true)
 		// d.decodeValueFn(rvv, valFn)
@@ -2297,6 +2297,10 @@ type Decoder struct {
 
 	hh Handle
 	h  *BasicHandle
+	// snap is the immutable extension generation this Decoder resolves
+	// extensions and codec functions against. It is pinned for the duration
+	// of a top-level Decode call, so one operation never mixes generations.
+	snap *extSnapshot
 
 	// ---- cpu cache line boundary?
 	decReaderSwitch
@@ -2386,6 +2390,10 @@ func (d *Decoder) resetCommon() {
 		d.stid = rt2id(d.h.SliceType)
 		d.str = fastpathAV.index(d.stid) != -1
 	}
+	// Drop the pinned generation. The snapshot itself is shared and owned by
+	// the Handle, so it is never released or reset here; the next operation
+	// simply loads whatever generation is current at that point.
+	d.snap = nil
 }
 
 // Reset the Decoder with a new Reader to decode from,
@@ -2531,9 +2539,30 @@ func (d *Decoder) MustDecode(v interface{}) {
 	d.mustDecode(v)
 }
 
+// snapshot returns the extension generation pinned for the current operation.
+// If no top-level Decode call is in progress, it returns the current
+// generation so callers outside the normal decode path still see a consistent
+// mapping.
+func (d *Decoder) snapshot() *extSnapshot {
+	if d.snap != nil {
+		return d.snap
+	}
+	return d.h.getExtSnapshot()
+}
+
 // MustDecode is like Decode, but panics if unable to Decode.
 // This provides insight to the code location that triggered the error.
 func (d *Decoder) mustDecode(v interface{}) {
+	// Pin one extension generation for the whole top-level Decode call.
+	// Extensions may call Decode recursively; those nested calls reuse the
+	// same snapshot instead of loading a newer one. The defer runs on the
+	// panic path too, so the next operation starts from the current
+	// generation again.
+	if d.snap == nil {
+		d.snap = d.h.getExtSnapshot()
+		defer func() { d.snap = nil }()
+	}
+
 	// TODO: Top-level: ensure that v is a pointer and not nil.
 	if d.d.TryDecodeAsNil() {
 		setZero(v)
@@ -2791,7 +2820,7 @@ func (d *Decoder) decodeValue(rv reflect.Value, fn *codecFn, chkAll bool) {
 
 	if fn == nil {
 		// always pass checkCodecSelfer=true, in case T or ****T is passed, where *T is a Selfer
-		fn = d.h.fn(rv.Type(), chkAll, true) // chkAll, chkAll)
+		fn = d.h.fnFor(d.snapshot(), rv.Type(), chkAll, true) // chkAll, chkAll)
 	}
 	if fn.i.addrD {
 		if rvpValid {

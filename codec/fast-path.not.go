@@ -27,7 +27,7 @@ type fastpathA [0]fastpathE
 func (x fastpathA) index(rtid uintptr) int { return -1 }
 
 func (_ fastpathT) DecSliceUint8V(v []uint8, canChange bool, d *Decoder) (_ []uint8, changed bool) {
-	fn := d.h.fn(uint8SliceTyp, true, true)
+	fn := d.h.fnFor(d.snapshot(), uint8SliceTyp, true, true)
 	d.kSlice(&fn.i, reflect.ValueOf(&v).Elem())
 	return v, true
 }

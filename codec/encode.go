@@ -614,7 +614,7 @@ func (e *Encoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 		// encoding type, because preEncodeValue may break it down to
 		// a concrete type and kInterface will bomb.
 		if rtelem.Kind() != reflect.Interface {
-			fn = e.h.fn(rtelem, true, true)
+			fn = e.h.fnFor(e.snapshot(), rtelem, true, true)
 		}
 		for j := 0; j < l; j++ {
 			if elemsep {
@@ -852,7 +852,7 @@ func (e *Encoder) kMap(f *codecFnInfo, rv reflect.Value) {
 		rtval = rtval.Elem()
 	}
 	if rtval.Kind() != reflect.Interface {
-		valFn = e.h.fn(rtval, true, true)
+		valFn = e.h.fnFor(e.snapshot(), rtval, true, true)
 	}
 	mks := rv.MapKeys()
 
@@ -869,7 +869,7 @@ func (e *Encoder) kMap(f *codecFnInfo, rv reflect.Value) {
 		}
 		if rtkey.Kind() != reflect.Interface {
 			// rtkeyid = rt2id(rtkey)
-			keyFn = e.h.fn(rtkey, true, true)
+			keyFn = e.h.fnFor(e.snapshot(), rtkey, true, true)
 		}
 	}
 
@@ -1239,6 +1239,10 @@ type Encoder struct {
 
 	h  *BasicHandle
 	hh Handle
+	// snap is the immutable extension generation this Encoder resolves
+	// extensions and codec functions against. It is pinned for the duration
+	// of a top-level Encode call, so one operation never mixes generations.
+	snap *extSnapshot
 	// ---- cpu cache line boundary? + 3
 	encWriterSwitch
 
@@ -1300,6 +1304,10 @@ func (e *Encoder) resetCommon() {
 	_, e.js = e.hh.(*JsonHandle)
 	e.e.reset()
 	e.err = nil
+	// Drop the pinned generation. The snapshot itself is shared and owned by
+	// the Handle, so it is never released or reset here; the next operation
+	// simply loads whatever generation is current at that point.
+	e.snap = nil
 }
 
 // Reset resets the Encoder with a new output stream.
@@ -1480,7 +1488,28 @@ func (e *Encoder) MustEncode(v interface{}) {
 	e.mustEncode(v)
 }
 
+// snapshot returns the extension generation pinned for the current operation.
+// If no top-level Encode call is in progress, it returns the current
+// generation so callers outside the normal encode path still see a consistent
+// mapping.
+func (e *Encoder) snapshot() *extSnapshot {
+	if e.snap != nil {
+		return e.snap
+	}
+	return e.h.getExtSnapshot()
+}
+
 func (e *Encoder) mustEncode(v interface{}) {
+	// Pin one extension generation for the whole top-level Encode call.
+	// Extensions may call Encode recursively; those nested calls reuse the
+	// same snapshot instead of loading a newer one. The defer runs on the
+	// panic path too, so the next operation starts from the current
+	// generation again.
+	if e.snap == nil {
+		e.snap = e.h.getExtSnapshot()
+		defer func() { e.snap = nil }()
+	}
+
 	if e.wf == nil {
 		e.encode(v)
 		e.e.atEndOfEncode()
@@ -1686,7 +1715,7 @@ TOP:
 	if fn == nil {
 		rt := rv.Type()
 		// always pass checkCodecSelfer=true, in case T or ****T is passed, where *T is a Selfer
-		fn = e.h.fn(rt, checkFastpath, true)
+		fn = e.h.fnFor(e.snapshot(), rt, checkFastpath, true)
 	}
 	if fn.i.addrE {
 		if rvpValid {

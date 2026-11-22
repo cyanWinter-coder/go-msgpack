@@ -516,9 +516,10 @@ type BasicHandle struct {
 	// If not configured, the default TypeInfos is used, which uses struct tag keys: codec, json
 	TypeInfos *TypeInfos
 
-	// Note: BasicHandle is not comparable, due to these slices here (extHandle, intf2impls).
-	// If *[]T is used instead, this becomes comparable, at the cost of extra indirection.
-	// Thses slices are used all the time, so keep as slices (not pointers).
+	// Note: BasicHandle is not comparable, due to the extension and
+	// intf2impls state below. Extension registrations are managed behind a
+	// lock and published as immutable snapshots, so a configured Handle can
+	// be shared while new extensions are registered.
 
 	extHandle
 
@@ -576,8 +577,8 @@ type BasicHandle struct {
 
 	// noBuiltInTypeChecker
 
-	rtidFns atomicRtidFnSlice
-	mu      sync.Mutex
+	// mu guards the lazy initialization in init.
+	mu sync.Mutex
 	// r []uintptr     // rtids mapped to s above
 }
 
@@ -648,9 +649,14 @@ LOOP:
 	return
 }
 
-func (x *BasicHandle) fn(rt reflect.Type, checkFastpath, checkCodecSelfer bool) (fn *codecFn) {
+// fnFor resolves the codec function for rt against the given extension
+// snapshot. An operation must pass the same snapshot for every lookup it
+// performs, so the mapping cannot change mid-operation. The result is cached
+// on that snapshot, never on the Handle, so a newly published generation
+// cannot reuse a function resolved from an older one.
+func (x *BasicHandle) fnFor(snap *extSnapshot, rt reflect.Type, checkFastpath, checkCodecSelfer bool) (fn *codecFn) {
 	rtid := rt2id(rt)
-	sp := x.rtidFns.load()
+	sp := snap.cache.rtidFns.load()
 	if sp != nil {
 		if _, fn = findFn(sp, rtid); fn != nil {
 			// xdebugf("<<<< %c: found fn for %v in rtidfns of size: %v", c.n, rt, len(sp))
@@ -684,7 +690,7 @@ func (x *BasicHandle) fn(rt reflect.Type, checkFastpath, checkCodecSelfer bool) 
 		fi.addrF = true
 		fi.addrD = true
 		fi.addrE = true
-	} else if xfFn := c.getExt(rtid); xfFn != nil {
+	} else if xfFn := snap.getExt(rtid); xfFn != nil {
 		fi.xfTag, fi.xfFn = xfFn.tag, xfFn.ext
 		fn.fe = (*Encoder).ext
 		fn.fd = (*Decoder).ext
@@ -814,7 +820,7 @@ func (x *BasicHandle) fn(rt reflect.Type, checkFastpath, checkCodecSelfer bool) 
 				fi.addrD = false
 				rt2 := reflect.SliceOf(ti.elem)
 				fn.fd = func(d *Decoder, xf *codecFnInfo, xrv reflect.Value) {
-					d.h.fn(rt2, true, false).fd(d, xf, xrv.Slice(0, xrv.Len()))
+					d.h.fnFor(d.snapshot(), rt2, true, false).fd(d, xf, xrv.Slice(0, xrv.Len()))
 				}
 				// fn.fd = (*Decoder).kArray
 			case reflect.Struct:
@@ -839,12 +845,12 @@ func (x *BasicHandle) fn(rt reflect.Type, checkFastpath, checkCodecSelfer bool) 
 		}
 	}
 
-	c.mu.Lock()
+	snap.cache.mu.Lock()
 	var sp2 []codecRtidFn
-	sp = c.rtidFns.load()
+	sp = snap.cache.rtidFns.load()
 	if sp == nil {
 		sp2 = []codecRtidFn{{rtid, fn}}
-		c.rtidFns.store(sp2)
+		snap.cache.rtidFns.store(sp2)
 		// xdebugf(">>>> adding rt: %v to rtidfns of size: %v", rt, len(sp2))
 		// xdebugf(">>>> loading stored rtidfns of size: %v", len(c.rtidFns.load()))
 	} else {
@@ -854,12 +860,12 @@ func (x *BasicHandle) fn(rt reflect.Type, checkFastpath, checkCodecSelfer bool) 
 			copy(sp2, sp[:idx])
 			copy(sp2[idx+1:], sp[idx:])
 			sp2[idx] = codecRtidFn{rtid, fn}
-			c.rtidFns.store(sp2)
+			snap.cache.rtidFns.store(sp2)
 			// xdebugf(">>>> adding rt: %v to rtidfns of size: %v", rt, len(sp2))
 
 		}
 	}
-	c.mu.Unlock()
+	snap.cache.mu.Unlock()
 	return
 }
 
@@ -868,13 +874,17 @@ func (x *BasicHandle) fn(rt reflect.Type, checkFastpath, checkCodecSelfer bool) 
 //
 // Once a handle is configured, it can be shared across multiple Encoders and Decoders.
 //
-// Note that a Handle is NOT safe for concurrent modification.
-// Consequently, do not modify it after it is configured if shared among
-// multiple Encoders and Decoders in different goroutines.
+// Extension registration is safe for concurrent use with other extension
+// registrations and with running Encoders and Decoders. Each registration is
+// validated and published as an immutable snapshot; it only affects operations
+// started after it completes, while operations already in progress finish with
+// the snapshot they pinned when they started.
 //
-// Consequently, the typical usage model is that a Handle is pre-configured
-// before first time use, and not modified while in use.
-// Such a pre-configured Handle is safe for concurrent access.
+// Other Handle configuration (e.g. option fields or Intf2Impl) is still not
+// safe for concurrent modification. The typical usage model remains to
+// configure a Handle before first use where possible. Doing so keeps the set of
+// generations small and avoids the cost of publishing a snapshot per
+// registration.
 type Handle interface {
 	Name() string
 	// return the basic handle. It may not have been inited.
@@ -1062,7 +1072,164 @@ type extTypeTagFn struct {
 	_padding [1]uint64 // padding
 }
 
-type extHandle []extTypeTagFn
+// codecFnCache holds the resolved codec functions for one extension generation.
+//
+// A cache belongs to exactly one extSnapshot. It is derived state: the
+// registrations in the snapshot are immutable, while the cache is populated
+// lazily and may be appended to concurrently.
+type codecFnCache struct {
+	rtidFns atomicRtidFnSlice
+	mu      sync.Mutex
+}
+
+// extSnapshot is an immutable view of the extensions registered on a Handle.
+//
+// Registrations never mutate a published snapshot. Instead, they validate the
+// change against the current snapshot and publish a new one with an atomic
+// store. An Encoder or Decoder pins a snapshot for the duration of one
+// top-level (En|De)code call, so a single operation can never observe a mix of
+// registrations published by different generations.
+type extSnapshot struct {
+	gen uint64
+
+	// all holds every registered extension in registration order.
+	all []*extTypeTagFn
+	// byTag maps an extension id to its registration.
+	byTag map[uint64]*extTypeTagFn
+	// byTyp maps both the type and its pointer type id to the same registration.
+	byTyp map[uintptr]*extTypeTagFn
+
+	// cache holds the codec functions resolved against this snapshot.
+	// It is not part of the published registration mapping.
+	cache codecFnCache
+}
+
+func newExtSnapshot(gen uint64) *extSnapshot {
+	return &extSnapshot{
+		gen:   gen,
+		byTag: make(map[uint64]*extTypeTagFn),
+		byTyp: make(map[uintptr]*extTypeTagFn),
+	}
+}
+
+func (s *extSnapshot) count() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.all)
+}
+
+func (s *extSnapshot) getExt(rtid uintptr) (v *extTypeTagFn) {
+	if s == nil {
+		return nil
+	}
+	return s.byTyp[rtid]
+}
+
+func (s *extSnapshot) getExtForTag(tag uint64) (v *extTypeTagFn) {
+	if s == nil {
+		return nil
+	}
+	return s.byTag[tag]
+}
+
+// clone returns a mutable copy of the snapshot's registration mapping.
+// The returned snapshot has a fresh cache, as its mappings may differ.
+func (s *extSnapshot) clone(gen uint64) *extSnapshot {
+	n := newExtSnapshot(gen)
+	n.all = make([]*extTypeTagFn, len(s.all))
+	copy(n.all, s.all)
+	for k, v := range s.byTag {
+		n.byTag[k] = v
+	}
+	for k, v := range s.byTyp {
+		n.byTyp[k] = v
+	}
+	return n
+}
+
+// withAdd validates fn against this snapshot and returns the next snapshot
+// with fn added. If validation fails, a nil snapshot and an error are
+// returned, and this snapshot remains current and usable.
+//
+// Each extension id, Go type and pointer alias must be unique. In particular,
+// a type cannot be re-registered: there is no way to change the mapping that
+// an in-flight operation may already be using.
+func (s *extSnapshot) withAdd(fn *extTypeTagFn) (*extSnapshot, error) {
+	if old := s.byTyp[fn.rtid]; old != nil {
+		return nil, fmt.Errorf("codec.Handle.SetExt: duplicate extension type %v: already registered with id %v",
+			fn.rt, old.tag)
+	}
+	if old := s.byTyp[fn.rtidptr]; old != nil {
+		return nil, fmt.Errorf("codec.Handle.SetExt: conflicting extension alias for type %v: already registered as %v with id %v",
+			fn.rt, old.rt, old.tag)
+	}
+	if old := s.byTag[fn.tag]; old != nil {
+		return nil, fmt.Errorf("codec.Handle.SetExt: duplicate extension id %v (conflicting extension type %v); already registered for type %v",
+			fn.tag, fn.rt, old.rt)
+	}
+
+	n := s.clone(s.gen + 1)
+	n.all = append(n.all, fn)
+	n.byTag[fn.tag] = fn
+	n.byTyp[fn.rtid] = fn
+	n.byTyp[fn.rtidptr] = fn
+	return n, nil
+}
+
+// withRemove returns the next snapshot with the extension for rtid removed.
+// It reports whether an entry was found.
+func (s *extSnapshot) withRemove(rtid uintptr) (n *extSnapshot, removed bool) {
+	old := s.byTyp[rtid]
+	if old == nil {
+		return s, false
+	}
+	n = newExtSnapshot(s.gen + 1)
+	n.all = make([]*extTypeTagFn, 0, len(s.all)-1)
+	for _, v := range s.all {
+		if v != old {
+			n.all = append(n.all, v)
+		}
+	}
+	for k, v := range s.byTag {
+		if v != old {
+			n.byTag[k] = v
+		}
+	}
+	for k, v := range s.byTyp {
+		if v != old {
+			n.byTyp[k] = v
+		}
+	}
+	return n, true
+}
+
+// extHandle stores the extension registrations for a Handle.
+//
+// The zero value is ready for use. Registrations are serialized, validated
+// against the current snapshot and then published atomically. Readers load the
+// current snapshot lock-free, and an operation holds on to the snapshot it
+// loaded until it completes.
+type extHandle struct {
+	mu   sync.Mutex
+	snap atomic.Pointer[extSnapshot]
+}
+
+// getExtSnapshot returns the current immutable snapshot, creating the empty
+// generation 0 snapshot on first use.
+func (o *extHandle) getExtSnapshot() *extSnapshot {
+	if s := o.snap.Load(); s != nil {
+		return s
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if s := o.snap.Load(); s != nil {
+		return s
+	}
+	s := newExtSnapshot(0)
+	o.snap.Store(s)
+	return s
+}
 
 // AddExt registes an encode and decode function for a reflect.Type.
 // To deregister an Ext, call AddExt with nil encfn and/or nil decfn.
@@ -1077,22 +1244,44 @@ func (o *extHandle) AddExt(rt reflect.Type, tag byte,
 	return o.SetExt(rt, uint64(tag), addExtWrapper{encfn, decfn})
 }
 
-// SetExt will set the extension for a tag and reflect.Type.
-// Note that the type must be a named type, and specifically not a pointer or Interface.
-// An error is returned if that is not honored.
-// To Deregister an ext, call SetExt with nil Ext.
-//
-// Deprecated: Use SetBytesExt or SetInterfaceExt on the Handle instead.
-func (o *extHandle) SetExt(rt reflect.Type, tag uint64, ext Ext) (err error) {
-	// o is a pointer, because we may need to initialize it
+// normalizeExtType dereferences rt and validates that it is a named,
+// non-interface type, which is what the extension mechanism requires.
+func normalizeExtType(rt reflect.Type) (reflect.Type, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("codec.Handle.SetExt: Takes named type, not a pointer or interface: <nil>")
+	}
 	rk := rt.Kind()
 	for rk == reflect.Pointer {
 		rt = rt.Elem()
 		rk = rt.Kind()
 	}
-
 	if rt.PkgPath() == "" || rk == reflect.Interface { // || rk == reflect.Pointer {
-		return fmt.Errorf("codec.Handle.SetExt: Takes named type, not a pointer or interface: %v", rt)
+		return nil, fmt.Errorf("codec.Handle.SetExt: Takes named type, not a pointer or interface: %v", rt)
+	}
+	return rt, nil
+}
+
+// SetExt will set the extension for a tag and reflect.Type.
+// Note that the type must be a named type, and specifically not a pointer or Interface.
+// An error is returned if that is not honored.
+// To Deregister an ext, call SetExt with nil Ext.
+//
+// Registration is transactional: duplicate extension ids, duplicate Go types
+// and conflicting aliases are rejected before publication, leaving the current
+// snapshot (and any operation using it) untouched.
+//
+// Deprecated: Use SetBytesExt or SetInterfaceExt on the Handle instead.
+func (o *extHandle) SetExt(rt reflect.Type, tag uint64, ext Ext) (err error) {
+	if ext == nil {
+		return o.removeExt(rt)
+	}
+	return o.addExt(rt, tag, ext)
+}
+
+func (o *extHandle) addExt(rt reflect.Type, tag uint64, ext Ext) (err error) {
+	rt, err = normalizeExtType(rt)
+	if err != nil {
+		return err
 	}
 
 	rtid := rt2id(rt)
@@ -1101,37 +1290,63 @@ func (o *extHandle) SetExt(rt reflect.Type, tag uint64, ext Ext) (err error) {
 		// all natively supported type, so cannot have an extension
 		return // TODO: should we silently ignore, or return an error???
 	}
-	o2 := *o
-	for i := range o2 {
-		v := &o2[i]
-		if v.rtid == rtid {
-			v.tag, v.ext = tag, ext
-			return
-		}
-	}
-	rtidptr := rt2id(reflect.PointerTo(rt))
-	*o = append(o2, extTypeTagFn{rtid, rtidptr, rt, tag, ext, [1]uint64{}})
-	return
-}
 
-func (o extHandle) getExt(rtid uintptr) (v *extTypeTagFn) {
-	for i := range o {
-		v = &o[i]
-		if v.rtid == rtid || v.rtidptr == rtid {
-			return
-		}
+	fn := &extTypeTagFn{
+		rtid:    rtid,
+		rtidptr: rt2id(reflect.PointerTo(rt)),
+		rt:      rt,
+		tag:     tag,
+		ext:     ext,
 	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cur := o.snap.Load()
+	if cur == nil {
+		cur = newExtSnapshot(0)
+	}
+	next, err := cur.withAdd(fn)
+	if err != nil {
+		return err
+	}
+	// Only publish after the whole change has been validated. Readers that
+	// already loaded cur keep using it until their operation completes.
+	o.snap.Store(next)
 	return nil
 }
 
-func (o extHandle) getExtForTag(tag uint64) (v *extTypeTagFn) {
-	for i := range o {
-		v = &o[i]
-		if v.tag == tag {
-			return
-		}
+func (o *extHandle) removeExt(rt reflect.Type) (err error) {
+	rt, err = normalizeExtType(rt)
+	if err != nil {
+		return err
 	}
+
+	rtid := rt2id(rt)
+	switch rtid {
+	case timeTypId, rawTypId, rawExtTypId:
+		return nil
+	}
+
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cur := o.snap.Load()
+	if cur == nil {
+		return nil
+	}
+	next, removed := cur.withRemove(rtid)
+	if !removed {
+		return nil
+	}
+	o.snap.Store(next)
 	return nil
+}
+
+func (o *extHandle) getExt(rtid uintptr) (v *extTypeTagFn) {
+	return o.getExtSnapshot().getExt(rtid)
+}
+
+func (o *extHandle) getExtForTag(tag uint64) (v *extTypeTagFn) {
+	return o.getExtSnapshot().getExtForTag(tag)
 }
 
 type intf2impl struct {

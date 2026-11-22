@@ -115,17 +115,19 @@ the standard net/rpc package.
 
 ## Usage
 
-The Handle is SAFE for concurrent READ, but NOT SAFE for concurrent
-modification.
+The Handle is SAFE for concurrent READ and for concurrent extension
+registration. Extensions are published as immutable generations: a
+registration only affects operations that start after it completes, and an
+operation already in progress finishes against the generation it pinned when
+it began.
 
 The Encoder and Decoder are NOT safe for concurrent use.
 
 Consequently, the usage model is basically:
 
-  - Create and initialize the Handle before any use.
-    Once created, DO NOT modify it.
-  - Multiple Encoders or Decoders can now use the Handle concurrently.
-    They only read information off the Handle (never write).
+  - Create and initialize the Handle before any use where possible.
+  - Multiple Encoders or Decoders can use the Handle concurrently, including
+    while new extensions are being registered.
   - However, each Encoder or Decoder MUST not be used concurrently
   - To re-use an Encoder/Decoder, call Reset(...) on it first.
     This allows you use state maintained on the Encoder/Decoder.
