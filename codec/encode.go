@@ -135,15 +135,18 @@ type EncodeOptions struct {
 	//
 	// This only affects maps, as the iteration order for maps is random.
 	//
-	// The implementation MAY use the natural sort order for the map keys if possible:
+	// The map keys are sorted before being written to the stream:
 	//
-	//     - If there is a natural sort order (ie for number, bool, string or []byte keys),
-	//       then the map keys are first sorted in natural order and then written
-	//       with corresponding map values to the strema.
+	//     - If there is a natural sort order (ie for bool, number, string or
+	//       time.Time keys), then the map keys are first sorted in natural
+	//       order and then written with corresponding map values to the stream.
 	//     - If there is no natural sort order, then the map keys will first be
-	//       encoded into []byte, and then sorted,
-	//       before writing the sorted keys and the corresponding map values to the stream.
+	//       encoded into []byte, and then sorted by their canonical encoded
+	//       bytes, before writing the sorted keys and the corresponding map
+	//       values to the stream.
 	//
+	// This way, the same logical value always encodes to the same bytes,
+	// making the output suitable for use as cache keys or content digests.
 	Canonical bool
 
 	// CheckCircularRef controls whether we check for circular references
@@ -1016,7 +1019,7 @@ func (e *Encoder) kMapCanonical(rtkey reflect.Type, rv reflect.Value, mks []refl
 			e.encodeValue(rv.MapIndex(mksv[i].r), valFn, true)
 		}
 	case reflect.Struct:
-		if rv.Type() == timeTyp {
+		if rtkey == timeTyp {
 			mksv := make([]timeRv, len(mks))
 			for i, k := range mks {
 				v := &mksv[i]
@@ -1451,6 +1454,9 @@ func (e *Encoder) Encode(v interface{}) (err error) {
 	if e.err != nil {
 		return e.err
 	}
+	// mark the current end of the output, so a failed encode can be
+	// rolled back and no partial value is left behind in the output.
+	mark := e.markOutput()
 	if recoverPanicToErr {
 		defer func() {
 			// if error occurred during encoding, return that error;
@@ -1462,6 +1468,9 @@ func (e *Encoder) Encode(v interface{}) (err error) {
 			} else {
 				panicValToErr(e, x, &e.err)
 				err = e.err
+			}
+			if err != nil {
+				e.rollbackOutput(mark)
 			}
 		}()
 	}
@@ -1477,7 +1486,41 @@ func (e *Encoder) MustEncode(v interface{}) {
 	if e.err != nil {
 		panic(e.err)
 	}
+	// as in Encode, roll back the output if encoding fails partway through,
+	// so no partial value is left behind in the output.
+	mark := e.markOutput()
+	defer func() {
+		if x := recover(); x != nil {
+			e.rollbackOutput(mark)
+			panic(x)
+		}
+	}()
 	e.mustEncode(v)
+}
+
+// markOutput returns the current offset into the output buffer if encoding
+// to a []byte, or -1 otherwise (e.g. when encoding to an io.Writer, where
+// bytes already flushed cannot be retracted).
+//
+// The mark is used to roll back the output if an encode fails, guaranteeing
+// that a failed encode never leaves a partially written value behind.
+func (e *Encoder) markOutput() int {
+	if e.bytes {
+		return len(e.wb.b)
+	}
+	return -1
+}
+
+// rollbackOutput discards any bytes written to the output buffer since the
+// given mark (previously returned by markOutput). It is a no-op if the mark
+// is negative i.e. the output is not a []byte.
+func (e *Encoder) rollbackOutput(mark int) {
+	if mark >= 0 && len(e.wb.b) > mark {
+		e.wb.b = e.wb.b[:mark]
+		if e.wb.out != nil {
+			*e.wb.out = e.wb.b
+		}
+	}
 }
 
 func (e *Encoder) mustEncode(v interface{}) {

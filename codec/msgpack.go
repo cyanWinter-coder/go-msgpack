@@ -290,6 +290,7 @@ func (e *msgpackEncDriver) EncodeTime(t time.Time) {
 	if e.h.TimeNotBuiltin {
 		bin, err := t.MarshalBinary()
 		if err != nil {
+			e.e.errorf("cannot encode time %v as binary: %v", t, err)
 			return
 		}
 		e.EncodeStringBytesRaw(bin)
