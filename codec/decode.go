@@ -1298,8 +1298,17 @@ func (d *Decoder) kInterfaceNaked(f *codecFnInfo) (rvn reflect.Value) {
 		if bytes == nil {
 			d.decode(&v)
 		}
-		bfn := d.h.getExtForTag(tag)
+		var bfn *extTypeTagFn
+		if d.extSnap != nil {
+			bfn = d.extSnap.getExtForTag(tag)
+		}
 		if bfn == nil {
+			bfn = d.h.getExtForTag(tag)
+		}
+		if bfn == nil {
+			if mh, ok := d.hh.(*MsgpackHandle); ok && mh.UnknownExtPolicy == UnknownExtError {
+				d.errorv(fmt.Errorf("%w: %d", ErrUnknownExt, tag))
+			}
 			var re RawExt
 			re.Tag = tag
 			re.Data = detachZeroCopyBytes(d.bytes, nil, bytes)
@@ -1665,7 +1674,7 @@ func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 				rv9 = reflect.New(rtelem0).Elem()
 			}
 			if fn == nil {
-				fn = d.h.fn(rtelem, true, true)
+				fn = d.fnFor(rtelem, true, true)
 			}
 			d.decodeValue(rv9, fn, true)
 			rv.Send(rv9)
@@ -1710,7 +1719,7 @@ func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 				}
 
 				if fn == nil {
-					fn = d.h.fn(rtelem, true, true)
+					fn = d.fnFor(rtelem, true, true)
 				}
 				d.decodeValue(rv9, fn, true)
 			}
@@ -1822,7 +1831,7 @@ func (d *Decoder) kMap(f *codecFnInfo, rv reflect.Value) {
 			// NOTE: if doing an insert, you MUST use a real string (not stringview)
 		} else {
 			if keyFn == nil {
-				keyFn = d.h.fn(ktypeLo, true, true)
+				keyFn = d.fnFor(ktypeLo, true, true)
 			}
 			d.decodeValue(rvk, keyFn, true)
 		}
@@ -1892,7 +1901,7 @@ func (d *Decoder) kMap(f *codecFnInfo, rv reflect.Value) {
 			rvk.SetString(d.string(kstrbs))
 		}
 		if valFn == nil {
-			valFn = d.h.fn(vtypeLo, true, true)
+			valFn = d.fnFor(vtypeLo, true, true)
 		}
 		d.decodeValue(rvv, valFn, true)
 		// d.decodeValueFn(rvv, valFn)
@@ -2298,6 +2307,11 @@ type Decoder struct {
 	hh Handle
 	h  *BasicHandle
 
+	// extSnap is the extension registry snapshot pinned for the in-flight
+	// top-level Decode call (see MsgpackHandle.ExtRegistry). nil if the
+	// handle has no ExtRegistry configured.
+	extSnap *ExtSnapshot
+
 	// ---- cpu cache line boundary?
 	decReaderSwitch
 
@@ -2370,6 +2384,7 @@ func (d *Decoder) resetCommon() {
 	// d.r = &d.decReaderSwitch
 	d.d.reset()
 	d.err = nil
+	d.extSnap = nil
 	d.depth = 0
 	d.maxdepth = d.h.MaxDepth
 	if d.maxdepth <= 0 {
@@ -2534,6 +2549,9 @@ func (d *Decoder) MustDecode(v interface{}) {
 // MustDecode is like Decode, but panics if unable to Decode.
 // This provides insight to the code location that triggered the error.
 func (d *Decoder) mustDecode(v interface{}) {
+	if d.pinExtSnap() {
+		defer d.unpinExtSnap()
+	}
 	// TODO: Top-level: ensure that v is a pointer and not nil.
 	if d.d.TryDecodeAsNil() {
 		setZero(v)
@@ -2791,7 +2809,7 @@ func (d *Decoder) decodeValue(rv reflect.Value, fn *codecFn, chkAll bool) {
 
 	if fn == nil {
 		// always pass checkCodecSelfer=true, in case T or ****T is passed, where *T is a Selfer
-		fn = d.h.fn(rv.Type(), chkAll, true) // chkAll, chkAll)
+		fn = d.fnFor(rv.Type(), chkAll, true) // chkAll, chkAll)
 	}
 	if fn.i.addrD {
 		if rvpValid {

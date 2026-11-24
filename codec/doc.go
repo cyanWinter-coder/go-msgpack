@@ -108,6 +108,41 @@ Consequently, if a type only defines one-half of the symmetry (e.g. it
 implements UnmarshalJSON() but not MarshalJSON() ), then that type doesn't
 satisfy the check and we will continue walking down the decision tree.
 
+## Hot-swappable Extensions (Msgpack)
+
+Extensions registered statically on a Handle (via SetExt/SetBytesExt/...)
+must not change once the Handle is in use. For applications which need to
+hot-reload extension registrations at runtime, MsgpackHandle accepts an
+ExtRegistry:
+
+```go
+
+	reg := codec.NewExtRegistry()
+	reg.RegisterBytesExt(reflect.TypeOf(MyType{}), 10, myExt)
+	mh := &codec.MsgpackHandle{WriteExt: true, ExtRegistry: reg}
+
+```
+
+The registry is safe for concurrent use and is generation-based: each
+Register/Unregister atomically publishes a new, immutable generation, and
+each Encode/Decode call pins exactly one snapshot of the registry for the
+whole duration of the call. Consequently:
+
+  - a single call never observes a mix of two registry generations;
+  - re-registering a type replaces its registration for later calls, while
+    in-flight calls keep using the snapshot they pinned;
+  - publishing a new generation never blocks in-flight calls, and an old
+    generation is reclaimed once no snapshot references it.
+
+Types registered in the pinned snapshot take precedence over extensions
+registered statically on the handle; other types fall back to the static
+registrations (and to generated code as before).
+
+When decoding encounters an extension tag with no registered extension,
+the default behavior is to decode it into a codec.RawExt value. Set
+MsgpackHandle.UnknownExtPolicy to codec.UnknownExtError to instead fail
+with an error matching codec.ErrUnknownExt (via errors.Is).
+
 ## RPC
 
 RPC Client and Server Codecs are implemented, so the codecs can be used with

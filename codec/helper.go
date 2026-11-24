@@ -347,6 +347,10 @@ func (e codecError) Error() string {
 	return fmt.Sprintf("%s error: %v", e.name, e.err)
 }
 
+// Unwrap returns the cause of the error, so errors.Is/errors.As can match
+// it (e.g. ErrUnknownExt). It is equivalent to Cause.
+func (e codecError) Unwrap() error { return e.Cause() }
+
 // type byteAccepter func(byte) bool
 
 var (

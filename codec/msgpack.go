@@ -1000,6 +1000,27 @@ type MsgpackHandle struct {
 	// PositiveIntUnsigned says to encode positive integers as unsigned.
 	PositiveIntUnsigned bool
 
+	// ExtRegistry, when non-nil, provides hot-swappable extension
+	// registrations for this handle.
+	//
+	// Each Encode or Decode call pins one snapshot of the registry for the
+	// whole duration of the call, so a call never observes a mix of two
+	// registry generations, and re-registration while calls are in flight
+	// does not disturb them.
+	//
+	// Types registered in the pinned snapshot take precedence over extensions
+	// registered statically on the handle (via SetExt/SetBytesExt/...);
+	// types not found in the snapshot fall back to the static registrations.
+	ExtRegistry *ExtRegistry
+
+	// UnknownExtPolicy controls how decoding handles an extension tag with
+	// no registered extension (in neither the pinned ExtRegistry snapshot
+	// nor the static handle extensions).
+	//
+	// The zero value (UnknownExtRawExt) decodes the extension into a RawExt
+	// value, matching the historical behavior.
+	UnknownExtPolicy UnknownExtPolicy
+
 	binaryEncodingType
 	noElemSeparators
 

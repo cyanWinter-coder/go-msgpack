@@ -161,6 +161,11 @@ func (f genHelperEncoder) I2Rtid(v interface{}) uintptr {
 
 // FOR USE BY CODECGEN ONLY. IT *WILL* CHANGE WITHOUT NOTICE. *DO NOT USE*
 func (f genHelperEncoder) Extension(rtid uintptr) (xfn *extTypeTagFn) {
+	if f.e.extSnap != nil {
+		if xfn = f.e.extSnap.getExt(rtid); xfn != nil {
+			return
+		}
+	}
 	return f.e.h.getExt(rtid)
 }
 
@@ -303,6 +308,11 @@ func (f genHelperDecoder) I2Rtid(v interface{}) uintptr {
 
 // FOR USE BY CODECGEN ONLY. IT *WILL* CHANGE WITHOUT NOTICE. *DO NOT USE*
 func (f genHelperDecoder) Extension(rtid uintptr) (xfn *extTypeTagFn) {
+	if f.d.extSnap != nil {
+		if xfn = f.d.extSnap.getExt(rtid); xfn != nil {
+			return
+		}
+	}
 	return f.d.h.getExt(rtid)
 }
 
