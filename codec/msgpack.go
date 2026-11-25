@@ -569,8 +569,13 @@ func (d *msgpackDecDriver) DecodeNaked() {
 		d.bdRead = false
 	}
 	if n.v == valueTypeUint && d.h.SignedInteger {
-		n.v = valueTypeInt
-		n.i = int64(n.u)
+		// Only widen into the signed representation when it can preserve the
+		// value. Values above math.MaxInt64 remain uint64 rather than wrapping
+		// to a negative int64.
+		if n.u <= math.MaxInt64 {
+			n.v = valueTypeInt
+			n.i = int64(n.u)
+		}
 	}
 }
 
@@ -587,7 +592,7 @@ func (d *msgpackDecDriver) DecodeInt64() (i int64) {
 	case mpUint32:
 		i = int64(uint64(bigen.Uint32(d.r.readx(4))))
 	case mpUint64:
-		i = int64(bigen.Uint64(d.r.readx(8)))
+		i = chkOvf.SignedIntV(bigen.Uint64(d.r.readx(8)))
 	case mpInt8:
 		i = int64(int8(d.r.readn1()))
 	case mpInt16:

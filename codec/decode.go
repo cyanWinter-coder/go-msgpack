@@ -1365,7 +1365,7 @@ func (d *Decoder) kInterface(f *codecFnInfo, rv reflect.Value) {
 		rvn = rv.Elem()
 	}
 	if d.d.TryDecodeAsNil() {
-		rv.Set(reflect.Zero(rvn.Type()))
+		setReflectToZeroValue(rv)
 		return
 	}
 
@@ -1698,15 +1698,18 @@ func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 				}
 			} else {
 				rv9 = rv.Index(j)
-				if d.h.SliceElementReset || decodeAsNil {
+				if decodeAsNil {
+					// Preserve the concrete type of an existing interface
+					// element, including a typed nil value.
+					setReflectToZeroValue(rv9)
+					continue
+				}
+				if d.h.SliceElementReset {
 					if !rtelem0ZeroValid {
 						rtelem0ZeroValid = true
 						rtelem0Zero = reflect.Zero(rtelem0)
 					}
 					rv9.Set(rtelem0Zero)
-					if decodeAsNil {
-						continue
-					}
 				}
 
 				if fn == nil {
@@ -1850,7 +1853,18 @@ func (d *Decoder) kMap(f *codecFnInfo, rv reflect.Value) {
 			if d.h.DeleteOnNilMapValue {
 				rv.SetMapIndex(rvk, reflect.Value{})
 			} else {
-				rv.SetMapIndex(rvk, reflect.Zero(vtype))
+				zv := reflect.Zero(vtype)
+				// Preserve the concrete type of an existing interface value,
+				// including a typed nil, instead of replacing it with an
+				// untyped nil interface.
+				if vtypeKind == reflect.Interface {
+					if old := rv.MapIndex(rvk); old.IsValid() && old.Kind() == reflect.Interface {
+						if oldElem := old.Elem(); oldElem.IsValid() {
+							zv = reflect.Zero(oldElem.Type())
+						}
+					}
+				}
+				rv.SetMapIndex(rvk, zv)
 			}
 			continue
 		}
@@ -2491,6 +2505,12 @@ func (d *Decoder) naked() *decNaked {
 // This in-place update can be disabled by configuring the MapValueReset and SliceElementReset
 // decode options available on every handle.
 //
+// If decoding fails, Decode restores the addressable destination value to the
+// value it had before the call. The same rollback occurs before MustDecode
+// re-panics. External side effects (for example, values sent to a channel or
+// mutations through aliases not reachable from the destination) are not
+// reversible.
+//
 // Furthermore, when decoding a stream map or array with length of 0 into a nil map or slice,
 // we reset the destination map or slice to a zero-length value.
 //
@@ -2508,6 +2528,7 @@ func (d *Decoder) Decode(v interface{}) (err error) {
 	if d.err != nil {
 		return d.err
 	}
+	rollback := snapshotDecodeDestination(v)
 	if recoverPanicToErr {
 		defer func() {
 			if x := recover(); x != nil {
@@ -2516,6 +2537,12 @@ func (d *Decoder) Decode(v interface{}) (err error) {
 			}
 		}()
 	}
+	defer func() {
+		if x := recover(); x != nil {
+			rollback()
+			panic(x)
+		}
+	}()
 
 	// defer d.deferred(&err)
 	d.mustDecode(v)
@@ -2528,6 +2555,13 @@ func (d *Decoder) MustDecode(v interface{}) {
 	if d.err != nil {
 		panic(d.err)
 	}
+	rollback := snapshotDecodeDestination(v)
+	defer func() {
+		if x := recover(); x != nil {
+			rollback()
+			panic(x)
+		}
+	}()
 	d.mustDecode(v)
 }
 

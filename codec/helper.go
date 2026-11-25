@@ -1223,8 +1223,22 @@ type structFieldInfo struct {
 
 func (si *structFieldInfo) setToZeroValue(v reflect.Value) {
 	if v, valid := si.field(v, false); valid {
-		v.Set(reflect.Zero(v.Type()))
+		setReflectToZeroValue(v)
 	}
+}
+
+// setReflectToZeroValue resets v to its zero value. Unlike reflect.Zero of an
+// interface type, an interface that already contains a typed nil or zero value
+// keeps that concrete type; a nil interface becomes nil. This makes stream nil
+// round-trips stable when decoding into an existing destination.
+func setReflectToZeroValue(v reflect.Value) {
+	if v.Kind() == reflect.Interface {
+		if e := v.Elem(); e.IsValid() {
+			v.Set(reflect.Zero(e.Type()))
+			return
+		}
+	}
+	v.Set(reflect.Zero(v.Type()))
 }
 
 // rv returns the field of the struct.
@@ -2083,19 +2097,9 @@ func (checkOverflow) Int(v int64, bitsize uint8) (overflow bool) {
 	return
 }
 func (checkOverflow) SignedInt(v uint64) (overflow bool) {
-	//e.g. -127 to 128 for int8
-	pos := (v >> 63) == 0
-	ui2 := v & 0x7fffffffffffffff
-	if pos {
-		if ui2 > math.MaxInt64 {
-			overflow = true
-		}
-	} else {
-		if ui2 > math.MaxInt64-1 {
-			overflow = true
-		}
-	}
-	return
+	// A positive uint64 can only be represented by int64 when it does not
+	// use the sign bit.
+	return v > math.MaxInt64
 }
 
 func (x checkOverflow) Float32V(v float64) float64 {
