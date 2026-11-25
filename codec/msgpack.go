@@ -815,7 +815,11 @@ func (d *msgpackDecDriver) readContainerLen(ct msgpackContainerType) (clen int) 
 	} else if bd == ct.b16 {
 		clen = int(bigen.Uint16(d.r.readx(2)))
 	} else if bd == ct.b32 {
-		clen = int(bigen.Uint32(d.r.readx(4)))
+		n := bigen.Uint32(d.r.readx(4))
+		if uint64(n) > uint64(maxDecoderInt()) {
+			panic(fmt.Errorf("%w: declared length %d overflows int", ErrContainerLengthExceeded, n))
+		}
+		clen = int(n)
 	} else if (ct.bFixMin & bd) == ct.bFixMin {
 		clen = int(ct.bFixMin ^ bd)
 	} else {
@@ -830,14 +834,18 @@ func (d *msgpackDecDriver) ReadMapStart() int {
 	if !d.bdRead {
 		d.readNextBd()
 	}
-	return d.readContainerLen(msgpackContainerMap)
+	clen := d.readContainerLen(msgpackContainerMap)
+	d.d.checkContainerBudget(valueTypeMap, clen)
+	return clen
 }
 
 func (d *msgpackDecDriver) ReadArrayStart() int {
 	if !d.bdRead {
 		d.readNextBd()
 	}
-	return d.readContainerLen(msgpackContainerList)
+	clen := d.readContainerLen(msgpackContainerList)
+	d.d.checkContainerBudget(valueTypeArray, clen)
+	return clen
 }
 
 func (d *msgpackDecDriver) readExtLen() (clen int) {

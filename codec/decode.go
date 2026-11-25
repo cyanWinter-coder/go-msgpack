@@ -39,7 +39,14 @@ var (
 	errDecUnreadByteNothingToRead   = errors.New("cannot unread - nothing has been read")
 	errDecUnreadByteLastByteNotRead = errors.New("cannot unread - last byte has not been read")
 	errDecUnreadByteUnknown         = errors.New("cannot unread - reason unknown")
-	errMaxDepthExceeded             = errors.New("maximum decoding depth exceeded")
+	// ErrMaxDepthExceeded is returned when nested arrays, maps or struct
+	// containers exceed DecodeOptions.MaxDepth.
+	ErrMaxDepthExceeded = errors.New("maximum decoding depth exceeded")
+	errMaxDepthExceeded = ErrMaxDepthExceeded
+
+	// ErrContainerLengthExceeded reports that a container header declared
+	// more entries than DecodeOptions.MaxContainerLen allows.
+	ErrContainerLengthExceeded = errors.New("declared container length exceeds configured limit")
 )
 
 /*
@@ -185,6 +192,7 @@ type DecodeOptions struct {
 
 	// MaxDepth defines the maximum depth when decoding nested
 	// maps and slices. If 0 or negative, we default to a suitably large number (currently 1024).
+	// Arrays, maps and struct containers share this budget.
 	MaxDepth int16
 
 	// If ErrorIfNoField, return an error when decoding a map
@@ -261,6 +269,17 @@ type DecodeOptions struct {
 	// RawToString controls how raw bytes in a stream are decoded into a nil interface{}.
 	// By default, they are decoded as []byte, but can be decoded as string (if configured).
 	RawToString bool
+
+	// MaxContainerLen is a hard limit on the declared number of elements in a
+	// single array, or key/value pairs in a single map. It is checked before
+	// the decoder allocates the container.
+	//
+	// This is intentionally separate from MaxInitLen: MaxInitLen only bounds
+	// the initial allocation, while decoding may grow a container as validated
+	// elements are consumed. If MaxContainerLen is 0 or negative, no hard
+	// per-container limit is applied; a declared length that cannot be backed
+	// by the remaining input is still rejected before allocation.
+	MaxContainerLen int
 }
 
 // ------------------------------------------------
@@ -313,6 +332,16 @@ func (z *ioDecReaderCommon) track() {
 func (z *ioDecReaderCommon) stopTrack() (bs []byte) {
 	z.trb = false
 	return z.tr
+}
+
+// takeTrack stops tracking and transfers ownership of the accumulated bytes
+// to the caller. It detaches the reader's reference so a Raw value can use the
+// tracking buffer directly without a second copy.
+func (z *ioDecReaderCommon) takeTrack() (bs []byte) {
+	z.trb = false
+	bs = z.tr
+	z.tr = nil
+	return bs
 }
 
 // ------------------------------------------
@@ -1749,6 +1778,7 @@ func (d *Decoder) kSlice(f *codecFnInfo, rv reflect.Value) {
 func (d *Decoder) kMap(f *codecFnInfo, rv reflect.Value) {
 	dd := d.d
 	containerLen := dd.ReadMapStart()
+	d.checkContainerBudget(valueTypeMap, containerLen)
 	elemsep := d.esep
 	ti := f.ti
 	if rv.IsNil() {
@@ -2162,6 +2192,18 @@ func (z *decReaderSwitch) stopTrack() []byte {
 	}
 }
 
+func (z *decReaderSwitch) takeTrack() []byte {
+	if z.bytes {
+		// Byte input tracking is only a pair of cursors; this is a view and
+		// rawBytes makes the single owned copy.
+		return z.rb.stopTrack()
+	} else if z.bufio {
+		return z.bi.takeTrack()
+	} else {
+		return z.ri.takeTrack()
+	}
+}
+
 // func (z *decReaderSwitch) unreadn1() {
 // 	if z.bytes {
 // 		z.rb.unreadn1()
@@ -2375,6 +2417,10 @@ func (d *Decoder) resetCommon() {
 	if d.maxdepth <= 0 {
 		d.maxdepth = decDefMaxDepth
 	}
+	// Do not retain naked byte values from the previous input lifecycle.
+	// Reader reset separately truncates, but deliberately reuses its tracking
+	// buffer capacity.
+	d.n = decNaked{}
 	// reset all things which were cached from the Handle, but could change
 	d.mtid, d.stid = 0, 0
 	d.mtr, d.str = false, false
@@ -2511,6 +2557,7 @@ func (d *Decoder) Decode(v interface{}) (err error) {
 	if recoverPanicToErr {
 		defer func() {
 			if x := recover(); x != nil {
+				d.discardTemporaryReferences()
 				panicValToErr(d, x, &d.err)
 				err = d.err
 			}
@@ -2528,6 +2575,15 @@ func (d *Decoder) MustDecode(v interface{}) {
 	if d.err != nil {
 		panic(d.err)
 	}
+	defer func() {
+		if x := recover(); x != nil {
+			// MustDecode still panics, but record the failure so a recovered
+			// Decoder cannot be fed more input before Reset.
+			d.discardTemporaryReferences()
+			panicValToErr(d, x, &d.err)
+			panic(x)
+		}
+	}()
 	d.mustDecode(v)
 }
 
@@ -2907,12 +2963,33 @@ func (d *Decoder) nextValueBytes() (bs []byte) {
 }
 
 func (d *Decoder) rawBytes() []byte {
-	// ensure that this is not a view into the bytes
-	// i.e. make new copy always.
-	bs := d.nextValueBytes()
+	// This mirrors nextValueBytes, but takes ownership of the io tracking
+	// buffer instead of leaving it referenced by the reader.
+	d.d.uncacheRead()
+	d.r.track()
+	d.swallow()
+	bs := d.r.takeTrack()
+	if !d.bytes {
+		// takeTrack already detached the owned io buffer; do not copy again.
+		return bs
+	}
+
+	// Direct byte input returns a view into the caller's slice. Make the
+	// single owned copy here.
 	bs2 := make([]byte, len(bs))
 	copy(bs2, bs)
 	return bs2
+}
+
+// discardTemporaryReferences releases transient byte slices retained by the
+// naked-value cache and read tracker after a decode failure. A failed Decoder
+// remains sticky until Reset, but it should not keep large temporary buffers
+// alive solely through those bookkeeping fields.
+func (d *Decoder) discardTemporaryReferences() {
+	d.n = decNaked{}
+	if d.r != nil {
+		_ = d.r.takeTrack()
+	}
 }
 
 func (d *Decoder) wrapErr(v interface{}, err *error) {
@@ -2941,8 +3018,18 @@ func (d *Decoder) decSliceHelperStart() (x decSliceHelper, clen int) {
 	case valueTypeArray:
 		x.array = true
 		clen = dd.ReadArrayStart()
+		d.checkContainerBudget(valueTypeArray, clen)
 	case valueTypeMap:
-		clen = dd.ReadMapStart() * 2
+		mapLen := dd.ReadMapStart()
+		d.checkContainerBudget(valueTypeMap, mapLen)
+		if mapLen < 0 {
+			clen = mapLen
+		} else {
+			if mapLen > maxDecoderInt()/2 {
+				d.errorf("map container length %d is too large to use as a slice length", mapLen)
+			}
+			clen = mapLen * 2
+		}
 	default:
 		d.errorf("only encoded map or array can be decoded into a slice (%d)", ctyp)
 	}
@@ -3029,6 +3116,16 @@ func decInferLen(clen, maxlen, unit int) (rvlen int) {
 		return
 	}
 	if unit == 0 {
+		// Zero-size elements still have per-entry container overhead (notably
+		// map buckets). Never pass an enormous declared length straight to
+		// make/makeMap; 4096 is the same conservative item floor used for
+		// large element types. The container can still grow as input validates.
+		if maxlen <= 0 {
+			maxlen = 4 * 1024
+		}
+		if clen > maxlen {
+			return maxlen
+		}
 		return clen
 	}
 	if maxlen <= 0 {

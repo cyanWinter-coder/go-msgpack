@@ -329,6 +329,11 @@ type codecError struct {
 }
 
 func (e codecError) Cause() error {
+	return e.Unwrap()
+}
+
+// Unwrap exposes the underlying decoding error to errors.Is and errors.As.
+func (e codecError) Unwrap() error {
 	switch xerr := e.err.(type) {
 	case nil:
 		return nil
